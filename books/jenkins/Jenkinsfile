@@ -5,31 +5,29 @@ pipeline {
     }
     agent {
       node {
-        //TODO: Add label for Node.js jenkins agent
+        label 'maven'
       }
     }
 
     environment {
-        //TODO: Edit these vars as per your env
-        DEV_PROJECT = "youruser-books-dev"
-        STAGE_PROJECT = "youruser-books-stage"
-        APP_GIT_URL = "https://github.com/youruser/DO288-apps"
-        NEXUS_SERVER = "http://nexus-common.apps.cluster.domain.example.com/repository/nodejs"
+        DEV_PROJECT = "jimrobison-movies-dev"
+        STAGE_PROJECT = "jimrobison-movies-stage"
+        APP_GIT_URL = "https://github.com/jimrobison/DO288-apps"
+        NEXUS_SERVER = "http://jenkins-jimrobison-jenkins.apps.ocp-na2.prod.nextcle.com/repository/java"
 
         // DO NOT CHANGE THE GLOBAL VARS BELOW THIS LINE
-        APP_NAME = "books"
+        APP_NAME = "movies"
     }
 
 
     stages {
 
-        stage('NPM Install') {
+        stage('Compilation Check') {
             steps {
-                echo '### Installing NPM dependencies ###'
+                echo '### Checking for compile errors ###'
                 sh '''
-                        npm config set registry ${NEXUS_SERVER}
-                        cd books
-                        npm install
+                        cd ${APP_NAME}
+                        mvn -s settings.xml -B clean compile
                    '''
             }
         }
@@ -37,14 +35,30 @@ pipeline {
         stage('Run Unit Tests') {
             steps {
                 echo '### Running unit tests ###'
-                sh 'cd books; npm test'
+                sh '''
+                        cd ${APP_NAME}
+                        mvn -s settings.xml -B clean test
+                   '''
             }
         }
 
-        stage('Run Linting Tools') {
+        stage('Static Code Analysis') {
             steps {
-                echo '### Running eslint on code ###'
-                sh 'cd books; npm run lint'
+                echo '### Running pmd on code ###'
+                sh '''
+                        cd ${APP_NAME}
+                        mvn -s settings.xml -B clean pmd:check
+                   '''
+            }
+        }
+
+        stage('Create fat JAR') {
+            steps {
+                echo '### Creating fat JAR ###'
+                sh '''
+                        cd ${APP_NAME}
+                        mvn -s settings.xml -B clean package -DskipTests=true
+                   '''
             }
         }
 
@@ -52,30 +66,24 @@ pipeline {
             steps {
                 echo '### Cleaning existing resources in DEV env ###'
                 sh '''
-                        oc project ${DEV_PROJECT}
-                        oc delete all -l app=${APP_NAME}
+                        oc delete all -l app=${APP_NAME} -n ${DEV_PROJECT}
+                        oc delete all -l build=${APP_NAME} -n ${DEV_PROJECT}
                         sleep 5
+                        oc new-build java:8 --name=${APP_NAME} --binary=true -n ${DEV_PROJECT}
                    '''
 
                 echo '### Creating a new app in DEV env ###'
-                //TODO: Create a new app and expose the service
-            }
-        }
-
-        stage('Wait for S2I build to complete') {
-            steps {
                 script {
                     openshift.withCluster() {
-                        openshift.withProject( "${DEV_PROJECT}" ) {
-                            def bc = openshift.selector("bc", "${APP_NAME}")
-                            bc.logs('-f')
-                            def builds = bc.related('builds')
-                            builds.untilEach(1) {
-                                return (it.object().status.phase == "Complete")
-                            }
-                        }
+                      openshift.withProject(env.DEV_PROJECT) {
+                        openshift.selector("bc", "${APP_NAME}").startBuild("--from-file=${APP_NAME}/target/${APP_NAME}.jar", "--wait=true", "--follow=true")
+                      }
                     }
                 }
+                sh '''
+                        oc new-app ${APP_NAME}:latest -n ${DEV_PROJECT}
+                        oc expose svc/${APP_NAME} -n ${DEV_PROJECT}
+                   '''
             }
         }
 
@@ -84,7 +92,6 @@ pipeline {
                 script {
                     openshift.withCluster() {
                         openshift.withProject( "${DEV_PROJECT}" ) {
-                            def deployment = openshift.selector("dc", "${APP_NAME}").rollout()
                             openshift.selector("dc", "${APP_NAME}").related('pods').untilEach(1) {
                                 return (it.object().status.phase == "Running")
                             }
@@ -99,7 +106,11 @@ pipeline {
                 timeout(time: 60, unit: 'MINUTES') {
                     input message: "Promote to Staging?"
                 }
-                //TODO: Tag the books:latest image stream as books:stage
+                script {
+                    openshift.withCluster() {
+                    openshift.tag("${DEV_PROJECT}/${APP_NAME}:latest", "${STAGE_PROJECT}/${APP_NAME}:stage")
+                    }
+                }
             }
         }
 
@@ -113,7 +124,11 @@ pipeline {
                    '''
 
                 echo '### Creating a new app in Staging ###'
-                //TODO: Create a new app in stage using the books:stage image stream and expose the service
+                sh '''
+                        oc project ${STAGE_PROJECT}
+                        oc new-app --name ${APP_NAME} -i ${APP_NAME}:stage
+                        oc expose svc/${APP_NAME}
+                   '''
             }
         }
 
@@ -125,9 +140,13 @@ pipeline {
                     routeHost = readFile('routehost').trim()
 
                     openshift.withCluster() {
-                        //TODO: Watch deployment until pod is in 'Running' state
-
-                        echo "Deployment to Staging env is complete. Access the app at the URL http://${routeHost}."
+                        openshift.withProject( "${STAGE_PROJECT}" ) {
+                            def deployment = openshift.selector("dc", "${APP_NAME}").rollout()
+                            openshift.selector("dc", "${APP_NAME}").related('pods').untilEach(1) {
+                                return (it.object().status.phase == "Running")
+                            }
+                        }
+                        echo "Deployment to Staging env is complete. Access the API endpoint at the URL http://${routeHost}/movies."
                     }
                 }
             }
